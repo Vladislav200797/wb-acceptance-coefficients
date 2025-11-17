@@ -1,157 +1,178 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Выгрузка коэффициентов приёмки (WB supplies API) в Supabase/public.
-
-Метод: GET https://supplies-api.wildberries.ru/api/v1/acceptance/coefficients
-
-Поведение:
-- Каждый запуск: ПОЛНЫЙ ПЕРЕЗАЛИВ (DELETE -> INSERT).
-- В Supabase храним ближайшие 14 дней по всем складам и типам поставок.
-
-Секреты / ENV:
-  WB_SUPPLIES_TOKEN       - API ключ поставщика (HeaderApiKey для supplies-api)
-  SUPABASE_URL
-  SUPABASE_SERVICE_KEY    - service_role key
-  SUPABASE_SCHEMA         - (опция, по умолчанию "public")
-  SUPABASE_TABLE          - (опция, по умолчанию "wb_acceptance_coefficients")
-"""
-
 import os
 import sys
-from typing import Any, Dict, List, Optional
+import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 import requests
 from supabase import create_client, Client
 
 
-API_URL = "https://supplies-api.wildberries.ru/api/v1/acceptance/coefficients"
-
-WB_SUPPLIES_TOKEN      = os.getenv("WB_SUPPLIES_TOKEN")
-SUPABASE_URL           = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY   = os.getenv("SUPABASE_SERVICE_KEY")
-SCHEMA                 = os.getenv("SUPABASE_SCHEMA", "public")
-TABLE_NAME             = os.getenv("SUPABASE_TABLE", "wb_acceptance_coefficients")
-
-HEADERS = {
-    "Authorization": WB_SUPPLIES_TOKEN or "",
-    "Content-Type": "application/json",
-}
+WB_ACCEPTANCE_URL = "https://supplies-api.wildberries.ru/api/v1/acceptance/coefficients"
 
 
-def fail(msg: str, code: int = 1):
-    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
-    sys.exit(code)
+def log(msg: str) -> None:
+    """Простой лог в stdout."""
+    print(msg, flush=True)
 
 
-def safe_to_numeric(value: Any) -> Optional[float]:
-    """Перевод WB-строк вида '123.45' в float. Если пусто или null — вернём None."""
+def get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(name, default)
+    if required and (value is None or value.strip() == ""):
+        log(f"ERROR: {name} is empty (set it in GitHub Secrets or env)")
+        sys.exit(1)
+    return value
+
+
+def fetch_acceptance_coefficients(token: str, warehouse_ids: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Вытягивает коэффициенты приёмки с WB API.
+    Если warehouse_ids=None -> по всем складам.
+    """
+    headers = {
+        "Authorization": token.strip()
+    }
+
+    params = {}
+    if warehouse_ids:
+        # пример: "507,117501"
+        params["warehouseIDs"] = warehouse_ids
+
+    log(f"Requesting WB acceptance coefficients (warehouseIDs={warehouse_ids or 'ALL'})...")
+    resp = requests.get(WB_ACCEPTANCE_URL, headers=headers, params=params, timeout=60)
+
+    if resp.status_code != 200:
+        log(f"ERROR: WB API {resp.status_code}: {resp.text}")
+        sys.exit(1)
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        log(f"ERROR: cannot decode WB response as JSON: {resp.text[:300]}")
+        sys.exit(1)
+
+    if not isinstance(data, list):
+        log(f"ERROR: unexpected WB format, expected list, got: {type(data)}; body snippet: {str(data)[:300]}")
+        sys.exit(1)
+
+    log(f"Fetched {len(data)} raw rows from WB")
+    return data
+
+
+def to_decimal(value: Any) -> Optional[float]:
+    """Аккуратное приведение к float, если возможно."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    if isinstance(value, str):
-        v = value.strip()
-        if not v:
-            return None
+    s = str(value).strip()
+    if s == "":
+        return None
+    try:
+        # WB иногда может отдавать строки, в том числе с точкой.
+        return float(s.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def normalize_rows(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Приводим формат WB к нашему табличному виду.
+    """
+    norm: List[Dict[str, Any]] = []
+
+    for row in raw_rows:
+        # date: string ("2024-04-11T00:00:00Z") -> date
+        date_str = row.get("date")  # пример: "2024-04-11T00:00:00Z"
+        if date_str:
+            try:
+                coeff_date = datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
+            except ValueError:
+                # если вдруг формат странный — пропускаем строчку
+                log(f"WARN: cannot parse date '{date_str}', skip row")
+                continue
+        else:
+            # без даты смысла нет, пропускаем
+            continue
+
+        item = {
+            "coeff_date": coeff_date.isoformat(),  # Supabase сам приведёт в date
+            "warehouse_id": row.get("warehouseID"),
+            "warehouse_name": row.get("warehouseName") or "",
+            "box_type_id": row.get("boxTypeID"),
+            "coefficient": to_decimal(row.get("coefficient")),
+            "allow_unload": bool(row.get("allowUnload", False)),
+            "storage_coef": to_decimal(row.get("storageCoef")),
+            "delivery_coef": to_decimal(row.get("deliveryCoef")),
+            "delivery_base_liter": to_decimal(row.get("deliveryBaseLiter")),
+            "delivery_additional_liter": to_decimal(row.get("deliveryAdditionalLiter")),
+            "storage_base_liter": to_decimal(row.get("storageBaseLiter")),
+            "storage_additional_liter": to_decimal(row.get("storageAdditionalLiter")),
+            "is_sorting_center": bool(row.get("isSortingCenter", False)),
+        }
+
+        norm.append(item)
+
+    log(f"Normalized rows: {len(norm)}")
+    return norm
+
+
+def chunked(iterable: List[Dict[str, Any]], size: int) -> List[List[Dict[str, Any]]]:
+    """Разбивает список на чанки фиксированного размера."""
+    return [iterable[i : i + size] for i in range(0, len(iterable), size)]
+
+
+def main() -> None:
+    # 🔐 Читаем переменные окружения
+    wb_token = get_env("WB_SUPPLIES_TOKEN", required=True)
+    supabase_url = get_env("SUPABASE_URL", required=True)
+    supabase_key = get_env("SUPABASE_SERVICE_KEY", required=True)
+    schema = get_env("SUPABASE_SCHEMA", required=False, default="public")
+    table_name = get_env("SUPABASE_TABLE", required=False, default="wb_acceptance_coefficients")
+    warehouse_ids = get_env("WB_WAREHOUSE_IDS", required=False, default=None)  # можно не задавать
+
+    # 📥 1) Тянем данные из WB
+    raw_rows = fetch_acceptance_coefficients(wb_token, warehouse_ids=warehouse_ids)
+    if not raw_rows:
+        log("No rows from WB, nothing to sync.")
+        return
+
+    # 🧹 2) Нормализуем
+    rows = normalize_rows(raw_rows)
+    if not rows:
+        log("No normalized rows, nothing to insert.")
+        return
+
+    # 🔗 3) Подключаемся к Supabase
+    sb: Client = create_client(supabase_url, supabase_key)
+
+    # 🗑 4) Удаляем старые данные ИЗ ТАБЛИЦЫ (нужно WHERE, иначе PostgREST ругается)
+    # Используем "мягкий truncate": удаляем всё, где coeff_date >= '1900-01-01' — то есть фактически все строки.
+    log(f"Deleting previous rows from {schema}.{table_name} ...")
+    try:
+        (
+            sb.schema(schema)
+            .table(table_name)
+            .delete()
+            .gte("coeff_date", "1900-01-01")
+            .execute()
+        )
+        log("Previous rows deleted.")
+    except Exception as e:
+        log(f"ERROR while deleting old rows: {e}")
+        sys.exit(1)
+
+    # 📤 5) Вставляем новые данные чанками
+    BATCH_SIZE = 1000
+    for i, batch in enumerate(chunked(rows, BATCH_SIZE), start=1):
+        log(f"Inserting batch {i} with {len(batch)} rows...")
         try:
-            # WB почти всегда отдаёт с точкой, но на всякий случай
-            v = v.replace(",", ".")
-            return float(v)
-        except ValueError:
-            return None
-    return None
+            sb.schema(schema).table(table_name).insert(batch).execute()
+        except Exception as e:
+            log(f"ERROR while inserting batch {i}: {e}")
+            sys.exit(1)
 
-
-def fetch_acceptance_coefficients() -> List[Dict[str, Any]]:
-    """Дёргаем WB API и возвращаем список записей."""
-    resp = requests.get(API_URL, headers=HEADERS, timeout=60)
-    if resp.status_code != 200:
-        fail(f"WB API {resp.status_code}: {resp.text}")
-
-    data = resp.json()
-    if not isinstance(data, list):
-        fail(f"Unexpected WB response shape (expected list): {data}")
-
-    return data
-
-
-def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Преобразуем одну запись WB в формат таблицы.
-    WB:
-      date: "2024-04-11T00:00:00Z"
-      coefficient: number
-      warehouseID: int
-      warehouseName: str
-      allowUnload: bool
-      boxTypeID: int | null
-      storageCoef, deliveryCoef: string | null
-      deliveryBaseLiter, deliveryAdditionalLiter, storageBaseLiter, storageAdditionalLiter: string | null
-      isSortingCenter: bool
-    """
-
-    raw_date = row.get("date")
-    coeff_date = None
-    if isinstance(raw_date, str) and "T" in raw_date:
-        coeff_date = raw_date.split("T", 1)[0]
-    else:
-        coeff_date = raw_date  # вдруг WB вернёт "YYYY-MM-DD"
-
-    return {
-        "coeff_date": coeff_date,
-        "warehouse_id": row.get("warehouseID"),
-        "warehouse_name": row.get("warehouseName"),
-        "box_type_id": row.get("boxTypeID"),
-        "coefficient": row.get("coefficient"),
-        "allow_unload": row.get("allowUnload"),
-
-        "storage_coef": safe_to_numeric(row.get("storageCoef")),
-        "delivery_coef": safe_to_numeric(row.get("deliveryCoef")),
-
-        "delivery_base_liter": safe_to_numeric(row.get("deliveryBaseLiter")),
-        "delivery_additional_liter": safe_to_numeric(row.get("deliveryAdditionalLiter")),
-        "storage_base_liter": safe_to_numeric(row.get("storageBaseLiter")),
-        "storage_additional_liter": safe_to_numeric(row.get("storageAdditionalLiter")),
-
-        "is_sorting_center": row.get("isSortingCenter"),
-    }
-
-
-def chunked(seq: List[Dict[str, Any]], size: int):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-def main():
-    if not WB_SUPPLIES_TOKEN:
-        fail("WB_SUPPLIES_TOKEN is empty (add it to GitHub Secrets)")
-
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        fail("Supabase URL or SERVICE KEY is empty")
-
-    sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
-    # 1) тянем данные из WB
-    rows = fetch_acceptance_coefficients()
-    print(f"Fetched {len(rows)} raw rows from WB", flush=True)
-
-    # 2) нормализуем
-    normalized = [normalize_row(r) for r in rows]
-    print(f"Normalized rows: {len(normalized)}", flush=True)
-
-    # 3) ПОЛНЫЙ ПЕРЕЗАЛИВ: удаляем все строки
-    sb.schema(SCHEMA).table(TABLE_NAME).delete().execute()
-    print("Cleared target table", flush=True)
-
-    # 4) вставляем батчами по 500
-    inserted = 0
-    for batch in chunked(normalized, 500):
-        sb.schema(SCHEMA).table(TABLE_NAME).insert(batch).execute()
-        inserted += len(batch)
-
-    print(f"Inserted rows: {inserted}", flush=True)
-    print("Acceptance coefficients sync OK", flush=True)
+    log(f"Done. Inserted total {len(rows)} rows into {schema}.{table_name}.")
 
 
 if __name__ == "__main__":
