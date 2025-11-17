@@ -1,0 +1,39 @@
+name: WB Acceptance Coefficients — Daily refresh (07:00 MSK)
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # 07:00 MSK == 04:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: wb-acceptance-coefficients
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run acceptance coefficients refresh
+        env:
+          PYTHONUNBUFFERED: "1"
+          WB_SUPPLIES_TOKEN:    ${{ secrets.WB_SUPPLIES_TOKEN }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_SCHEMA: "public"
+          SUPABASE_TABLE:  "wb_acceptance_coefficients"
+        run: |
+          python -u fetch_wb_acceptance_coefficients.py
